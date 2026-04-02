@@ -4,6 +4,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -32,6 +33,8 @@ PLAYWRIGHT_BROWSERS_DIR = APP_DATA_DIR / "ms-playwright"
 PLAYWRIGHT_BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_DIR))
 APP_STATE_FILE = APP_DATA_DIR / "app_state.json"
+INSTALL_TIMEOUT_SECONDS = 900
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 PLAYWRIGHT_AVAILABLE = False
 PLAYWRIGHT_IMPORT_ERROR = ""
@@ -72,6 +75,7 @@ class HtmlDownloaderApp:
         self.download_results: list[DownloadResult] = []
         self.playwright_ready = False
         self.installation_in_progress = False
+        self.install_process: subprocess.Popen[str] | None = None
         self.state = self._load_state()
 
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "downloaded_html"))
@@ -139,6 +143,8 @@ class HtmlDownloaderApp:
         ttk.Entry(browser_row, textvariable=self.wait_after_load_var, width=8).pack(side="left", padx=(8, 18))
         self.install_browser_button = ttk.Button(browser_row, text="Проверить / установить Chromium", command=self.install_browser_dependencies)
         self.install_browser_button.pack(side="left")
+        self.copy_install_command_button = ttk.Button(browser_row, text="Скопировать команду установки", command=self.copy_install_command)
+        self.copy_install_command_button.pack(side="left", padx=(8, 0))
 
         self.mode_hint_label = ttk.Label(settings, text="", foreground="#666666")
         self.mode_hint_label.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -281,11 +287,18 @@ class HtmlDownloaderApp:
         except Exception:
             self._append_log(f"Папка результата: {path}")
 
+    def copy_install_command(self) -> None:
+        command = self._get_manual_install_command()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(command)
+        self._append_log("Команда установки Chromium скопирована в буфер обмена.")
+
     def install_browser_dependencies(self) -> None:
         if self.installation_in_progress:
             return
         self.installation_in_progress = True
         self.install_browser_button.configure(state="disabled")
+        self.copy_install_command_button.configure(state="disabled")
         self._append_log("Запущена проверка / установка зависимостей для браузерного режима...")
         threading.Thread(target=self._install_browser_dependencies_worker, daemon=True).start()
 
@@ -293,7 +306,7 @@ class HtmlDownloaderApp:
         try:
             if not PLAYWRIGHT_AVAILABLE:
                 if getattr(sys, "frozen", False):
-                    self.log_queue.put(("log", "Текущая exe-сборка не содержит playwright. Пересоберите приложение в окружении, где установлен playwright."))
+                    self.log_queue.put(("log", "Текущая exe-сборка не содержит playwright. Нужна пересборка с включёнными модулями playwright."))
                     return
 
                 self.log_queue.put(("log", "Playwright не найден. Пытаюсь установить python-пакет..."))
@@ -303,6 +316,7 @@ class HtmlDownloaderApp:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=CREATE_NO_WINDOW,
                 )
                 if completed.stdout.strip():
                     self.log_queue.put(("log", completed.stdout.strip()))
@@ -318,24 +332,10 @@ class HtmlDownloaderApp:
                     return
 
             self.log_queue.put(("log", f"Устанавливаю Chromium в {PLAYWRIGHT_BROWSERS_DIR} ..."))
-            self.log_queue.put(("log", "Первый запуск может занять некоторое время."))
-            node_path, cli_path = COMPUTE_DRIVER_EXECUTABLE()
-            env = os.environ.copy()
-            env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
-            completed = subprocess.run(
-                [node_path, cli_path, "install", "chromium"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                env=env,
-            )
-            if completed.stdout.strip():
-                self.log_queue.put(("log", completed.stdout.strip()))
-            if completed.stderr.strip():
-                self.log_queue.put(("log", completed.stderr.strip()))
-            if completed.returncode != 0:
-                self.log_queue.put(("log", "Установка Chromium завершилась с ошибкой."))
+            self.log_queue.put(("log", "Окно консоли появляться не должно. Если установка затянулась, используйте кнопку копирования команды и выполните её вручную."))
+
+            install_result = self._run_chromium_install_process()
+            if not install_result:
                 return
 
             if self._refresh_playwright_status():
@@ -345,7 +345,113 @@ class HtmlDownloaderApp:
         except Exception as exc:
             self.log_queue.put(("log", f"Ошибка установки зависимостей: {exc}"))
         finally:
+            self.install_process = None
             self.log_queue.put(("install_done", ""))
+
+    def _run_chromium_install_process(self) -> bool:
+        node_path, cli_path = COMPUTE_DRIVER_EXECUTABLE()
+        env = os.environ.copy()
+        env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
+
+        install_command = [node_path, cli_path, "install", "chromium"]
+        self.log_queue.put(("log", f"Команда установки: {' '.join(install_command)}"))
+
+        startupinfo = None
+        if os.name == "nt":
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = 0
+
+        self.install_process = subprocess.Popen(
+            install_command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+            startupinfo=startupinfo,
+        )
+
+        assert self.install_process.stdout is not None
+        start_time = time.time()
+        last_output_time = time.time()
+        current_line = []
+
+        while True:
+            if self.install_process.poll() is not None:
+                tail = self.install_process.stdout.read()
+                if tail:
+                    for line in tail.splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            self.log_queue.put(("log", stripped))
+                break
+
+            char = self.install_process.stdout.read(1)
+            if char:
+                current_line.append(char)
+                last_output_time = time.time()
+                if char == "\n":
+                    line = ''.join(current_line).strip()
+                    current_line.clear()
+                    if line:
+                        self.log_queue.put(("log", line))
+            else:
+                time.sleep(0.1)
+
+            elapsed = time.time() - start_time
+            if int(elapsed) % 5 == 0:
+                browser_dir_size_mb = self._get_directory_size_mb(PLAYWRIGHT_BROWSERS_DIR)
+                self.log_queue.put(("install_progress", f"Идёт установка Chromium... {int(elapsed)} сек, размер папки: {browser_dir_size_mb:.1f} MB"))
+                time.sleep(1)
+
+            if time.time() - last_output_time > 120:
+                browser_dir_size_mb = self._get_directory_size_mb(PLAYWRIGHT_BROWSERS_DIR)
+                self.log_queue.put(("log", f"Установщик не выводит новых строк уже 120 сек. Текущий размер папки браузеров: {browser_dir_size_mb:.1f} MB"))
+                self.log_queue.put(("log", f"Можно выполнить вручную: {self._get_manual_install_command()}"))
+                self.install_process.terminate()
+                self.install_process.wait(timeout=10)
+                return False
+
+            if time.time() - start_time > INSTALL_TIMEOUT_SECONDS:
+                self.log_queue.put(("log", f"Установка прервана по таймауту {INSTALL_TIMEOUT_SECONDS} сек."))
+                self.log_queue.put(("log", f"Можно выполнить вручную: {self._get_manual_install_command()}"))
+                self.install_process.terminate()
+                self.install_process.wait(timeout=10)
+                return False
+
+        if current_line:
+            line = ''.join(current_line).strip()
+            if line:
+                self.log_queue.put(("log", line))
+
+        returncode = self.install_process.returncode
+        if returncode != 0:
+            self.log_queue.put(("log", f"Установка Chromium завершилась с кодом {returncode}."))
+            self.log_queue.put(("log", f"Для ручной установки выполните: {self._get_manual_install_command()}"))
+            return False
+        return True
+
+    def _get_manual_install_command(self) -> str:
+        if getattr(sys, 'frozen', False):
+            driver_dir = PLAYWRIGHT_BROWSERS_DIR.parent
+            return f"set PLAYWRIGHT_BROWSERS_PATH={PLAYWRIGHT_BROWSERS_DIR} && python -m playwright install chromium"
+        return f"set PLAYWRIGHT_BROWSERS_PATH={PLAYWRIGHT_BROWSERS_DIR} && {sys.executable} -m playwright install chromium"
+
+    @staticmethod
+    def _get_directory_size_mb(path: Path) -> float:
+        total = 0
+        if not path.exists():
+            return 0.0
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    pass
+        return total / (1024 * 1024)
 
     def _reload_playwright_module(self) -> None:
         global PLAYWRIGHT_AVAILABLE, PLAYWRIGHT_IMPORT_ERROR, SYNC_PLAYWRIGHT, COMPUTE_DRIVER_EXECUTABLE
@@ -666,7 +772,10 @@ class HtmlDownloaderApp:
                 elif kind == "install_done":
                     self.installation_in_progress = False
                     self.install_browser_button.configure(state="normal")
+                    self.copy_install_command_button.configure(state="normal")
                     self._refresh_playwright_status(log_result=True)
+                elif kind == "install_progress":
+                    self.progress_label.configure(text=payload)
         except queue.Empty:
             pass
         finally:
