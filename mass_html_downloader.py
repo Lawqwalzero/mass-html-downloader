@@ -1,7 +1,11 @@
 import csv
+import importlib
+import json
 import os
 import queue
 import re
+import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
@@ -22,11 +26,24 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+APP_DATA_DIR = Path(os.getenv("LOCALAPPDATA", str(Path.home()))) / "MassHtmlDownloader"
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+PLAYWRIGHT_BROWSERS_DIR = APP_DATA_DIR / "ms-playwright"
+PLAYWRIGHT_BROWSERS_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(PLAYWRIGHT_BROWSERS_DIR))
+APP_STATE_FILE = APP_DATA_DIR / "app_state.json"
+
 PLAYWRIGHT_AVAILABLE = False
 PLAYWRIGHT_IMPORT_ERROR = ""
+SYNC_PLAYWRIGHT = None
+COMPUTE_DRIVER_EXECUTABLE = None
 
 try:
-    from playwright.sync_api import sync_playwright
+    from playwright.sync_api import sync_playwright as _sync_playwright
+    from playwright._impl._driver import compute_driver_executable as _compute_driver_executable
+
+    SYNC_PLAYWRIGHT = _sync_playwright
+    COMPUTE_DRIVER_EXECUTABLE = _compute_driver_executable
     PLAYWRIGHT_AVAILABLE = True
 except Exception as playwright_exc:  # pragma: no cover
     PLAYWRIGHT_IMPORT_ERROR = str(playwright_exc)
@@ -53,6 +70,9 @@ class HtmlDownloaderApp:
         self.stop_requested = False
         self.is_running = False
         self.download_results: list[DownloadResult] = []
+        self.playwright_ready = False
+        self.installation_in_progress = False
+        self.state = self._load_state()
 
         self.output_dir_var = tk.StringVar(value=str(Path.cwd() / "downloaded_html"))
         self.workers_var = tk.StringVar(value=str(DEFAULT_WORKERS))
@@ -68,6 +88,7 @@ class HtmlDownloaderApp:
 
         self._build_ui()
         self.root.after(120, self._poll_log_queue)
+        self.root.after(250, self._run_startup_checks)
 
     def _build_ui(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -115,7 +136,9 @@ class HtmlDownloaderApp:
         browser_row.grid(row=4, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Checkbutton(browser_row, text="Headless браузер", variable=self.headless_var).pack(side="left", padx=(0, 18))
         ttk.Label(browser_row, text="Ожидание после загрузки, сек").pack(side="left")
-        ttk.Entry(browser_row, textvariable=self.wait_after_load_var, width=8).pack(side="left", padx=(8, 0))
+        ttk.Entry(browser_row, textvariable=self.wait_after_load_var, width=8).pack(side="left", padx=(8, 18))
+        self.install_browser_button = ttk.Button(browser_row, text="Проверить / установить Chromium", command=self.install_browser_dependencies)
+        self.install_browser_button.pack(side="left")
 
         self.mode_hint_label = ttk.Label(settings, text="", foreground="#666666")
         self.mode_hint_label.grid(row=5, column=0, columnspan=4, sticky="w", pady=(8, 0))
@@ -161,15 +184,89 @@ class HtmlDownloaderApp:
         log_scroll.grid(row=0, column=1, sticky="ns")
         self.log_text.configure(yscrollcommand=log_scroll.set)
 
+    def _load_state(self) -> dict:
+        if APP_STATE_FILE.exists():
+            try:
+                return json.loads(APP_STATE_FILE.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+        return {}
+
+    def _save_state(self) -> None:
+        APP_STATE_FILE.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _run_startup_checks(self) -> None:
+        self._append_log(f"Playwright browsers path: {PLAYWRIGHT_BROWSERS_DIR}")
+        self._refresh_playwright_status(log_result=True)
+
+        if self.state.get("browser_dependencies_checked_once"):
+            return
+
+        self.state["browser_dependencies_checked_once"] = True
+        self._save_state()
+
+        if self.playwright_ready:
+            return
+
+        if PLAYWRIGHT_AVAILABLE:
+            install_now = messagebox.askyesno(
+                "Установка Chromium",
+                "Для браузерного режима нужен Chromium для Playwright.\n\n"
+                "Программа может сама проверить и установить его в первый запуск.\n\n"
+                "Установить сейчас?",
+            )
+            if install_now:
+                self.install_browser_dependencies()
+            return
+
+        if not getattr(sys, "frozen", False):
+            install_package = messagebox.askyesno(
+                "Установка Playwright",
+                "Python-пакет playwright не найден.\n\n"
+                "Программа может попытаться установить его автоматически.\n\n"
+                "Установить сейчас?",
+            )
+            if install_package:
+                self.install_browser_dependencies()
+
     def _refresh_mode_hint(self) -> None:
         if self.mode_var.get() == "http":
             text = "HTTP — быстрый режим. Подходит для обычных страниц, где HTML доступен сразу в ответе сервера."
         else:
-            if PLAYWRIGHT_AVAILABLE:
-                text = "Playwright — медленнее, но подходит для страниц, где контент появляется только после выполнения JavaScript."
+            if self.playwright_ready:
+                text = f"Playwright готов. Chromium найден. Путь браузеров: {PLAYWRIGHT_BROWSERS_DIR}"
+            elif PLAYWRIGHT_AVAILABLE:
+                text = (
+                    "Playwright импортируется, но Chromium для браузерного режима не найден. "
+                    "Нажмите 'Проверить / установить Chromium'."
+                )
             else:
-                text = "Playwright пока недоступен. Для браузерного режима установите playwright: pip install playwright && playwright install"
+                text = (
+                    "Playwright пока недоступен. Для режима браузера программа может попытаться установить зависимость автоматически "
+                    "или можно выполнить: python -m pip install playwright"
+                )
         self.mode_hint_label.configure(text=text)
+
+    def _refresh_playwright_status(self, log_result: bool = False) -> bool:
+        self.playwright_ready = False
+        if not PLAYWRIGHT_AVAILABLE or SYNC_PLAYWRIGHT is None:
+            if log_result:
+                self._append_log(f"Playwright import error: {PLAYWRIGHT_IMPORT_ERROR}")
+            self._refresh_mode_hint()
+            return False
+
+        try:
+            with SYNC_PLAYWRIGHT() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                browser.close()
+            self.playwright_ready = True
+            if log_result:
+                self._append_log("Playwright: Chromium доступен.")
+        except Exception as exc:
+            if log_result:
+                self._append_log(f"Playwright: Chromium недоступен. {exc}")
+        self._refresh_mode_hint()
+        return self.playwright_ready
 
     def choose_output_dir(self) -> None:
         folder = filedialog.askdirectory(title="Выберите папку для сохранения HTML")
@@ -183,6 +280,86 @@ class HtmlDownloaderApp:
             os.startfile(path)  # type: ignore[attr-defined]
         except Exception:
             self._append_log(f"Папка результата: {path}")
+
+    def install_browser_dependencies(self) -> None:
+        if self.installation_in_progress:
+            return
+        self.installation_in_progress = True
+        self.install_browser_button.configure(state="disabled")
+        self._append_log("Запущена проверка / установка зависимостей для браузерного режима...")
+        threading.Thread(target=self._install_browser_dependencies_worker, daemon=True).start()
+
+    def _install_browser_dependencies_worker(self) -> None:
+        try:
+            if not PLAYWRIGHT_AVAILABLE:
+                if getattr(sys, "frozen", False):
+                    self.log_queue.put(("log", "Текущая exe-сборка не содержит playwright. Пересоберите приложение в окружении, где установлен playwright."))
+                    return
+
+                self.log_queue.put(("log", "Playwright не найден. Пытаюсь установить python-пакет..."))
+                completed = subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "playwright"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                if completed.stdout.strip():
+                    self.log_queue.put(("log", completed.stdout.strip()))
+                if completed.returncode != 0:
+                    error_text = completed.stderr.strip() or "Не удалось установить playwright."
+                    self.log_queue.put(("log", error_text))
+                    return
+
+                self.log_queue.put(("log", "Python-пакет playwright установлен. Перезагружаю модуль..."))
+                self._reload_playwright_module()
+                if not PLAYWRIGHT_AVAILABLE:
+                    self.log_queue.put(("log", f"Playwright по-прежнему недоступен: {PLAYWRIGHT_IMPORT_ERROR}"))
+                    return
+
+            self.log_queue.put(("log", f"Устанавливаю Chromium в {PLAYWRIGHT_BROWSERS_DIR} ..."))
+            self.log_queue.put(("log", "Первый запуск может занять некоторое время."))
+            node_path, cli_path = COMPUTE_DRIVER_EXECUTABLE()
+            env = os.environ.copy()
+            env["PLAYWRIGHT_BROWSERS_PATH"] = str(PLAYWRIGHT_BROWSERS_DIR)
+            completed = subprocess.run(
+                [node_path, cli_path, "install", "chromium"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=env,
+            )
+            if completed.stdout.strip():
+                self.log_queue.put(("log", completed.stdout.strip()))
+            if completed.stderr.strip():
+                self.log_queue.put(("log", completed.stderr.strip()))
+            if completed.returncode != 0:
+                self.log_queue.put(("log", "Установка Chromium завершилась с ошибкой."))
+                return
+
+            if self._refresh_playwright_status():
+                self.log_queue.put(("log", "Chromium успешно установлен. Браузерный режим готов к работе."))
+            else:
+                self.log_queue.put(("log", "Установка завершилась, но Chromium всё ещё недоступен. Проверьте лог выше."))
+        except Exception as exc:
+            self.log_queue.put(("log", f"Ошибка установки зависимостей: {exc}"))
+        finally:
+            self.log_queue.put(("install_done", ""))
+
+    def _reload_playwright_module(self) -> None:
+        global PLAYWRIGHT_AVAILABLE, PLAYWRIGHT_IMPORT_ERROR, SYNC_PLAYWRIGHT, COMPUTE_DRIVER_EXECUTABLE
+        try:
+            importlib.invalidate_caches()
+            sync_module = importlib.import_module("playwright.sync_api")
+            driver_module = importlib.import_module("playwright._impl._driver")
+            SYNC_PLAYWRIGHT = getattr(sync_module, "sync_playwright")
+            COMPUTE_DRIVER_EXECUTABLE = getattr(driver_module, "compute_driver_executable")
+            PLAYWRIGHT_AVAILABLE = True
+            PLAYWRIGHT_IMPORT_ERROR = ""
+        except Exception as exc:
+            PLAYWRIGHT_AVAILABLE = False
+            PLAYWRIGHT_IMPORT_ERROR = str(exc)
 
     def import_urls(self) -> None:
         file_path = filedialog.askopenfilename(
@@ -236,12 +413,19 @@ class HtmlDownloaderApp:
             messagebox.showerror("Ошибка", "Проверьте числовые параметры.")
             return
 
-        if self.mode_var.get() == "browser" and not PLAYWRIGHT_AVAILABLE:
-            messagebox.showerror(
-                "Playwright не установлен",
-                "Для браузерного режима выполните:\n\npip install playwright\nplaywright install\n\nПосле этого перезапустите утилиту.",
-            )
-            return
+        if self.mode_var.get() == "browser":
+            if self.installation_in_progress:
+                messagebox.showinfo("Установка ещё идёт", "Дождитесь завершения установки Chromium.")
+                return
+            if not self._refresh_playwright_status(log_result=True):
+                install_now = messagebox.askyesno(
+                    "Chromium не установлен",
+                    "Для браузерного режима не найден Chromium для Playwright.\n\n"
+                    "Установить автоматически сейчас?",
+                )
+                if install_now:
+                    self.install_browser_dependencies()
+                return
 
         output_dir = self.output_dir_var.get().strip()
         if not output_dir:
@@ -394,10 +578,10 @@ class HtmlDownloaderApp:
             raise RuntimeError(f"URL error: {exc.reason}") from exc
 
     def _fetch_via_browser(self, url: str, timeout: int, wait_after_load: float) -> tuple[str, str]:
-        if not PLAYWRIGHT_AVAILABLE:
-            raise RuntimeError(f"Playwright недоступен: {PLAYWRIGHT_IMPORT_ERROR}")
+        if not self.playwright_ready:
+            raise RuntimeError("Chromium для Playwright не установлен. Нажмите 'Проверить / установить Chromium'.")
         timeout_ms = timeout * 1000
-        with sync_playwright() as playwright:
+        with SYNC_PLAYWRIGHT() as playwright:
             browser = playwright.chromium.launch(headless=self.headless_var.get())
             page = browser.new_page(user_agent=USER_AGENT)
             try:
@@ -479,6 +663,10 @@ class HtmlDownloaderApp:
                     self.is_running = False
                     self.start_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
+                elif kind == "install_done":
+                    self.installation_in_progress = False
+                    self.install_browser_button.configure(state="normal")
+                    self._refresh_playwright_status(log_result=True)
         except queue.Empty:
             pass
         finally:
