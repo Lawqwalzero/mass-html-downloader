@@ -4,7 +4,6 @@ import json
 import os
 import queue
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -163,13 +162,30 @@ class HtmlDownloaderApp:
         urls_frame = ttk.LabelFrame(main, text="Ссылки — по одной на строку", padding=8)
         urls_frame.grid(row=2, column=0, sticky="nsew")
         urls_frame.columnconfigure(0, weight=1)
-        urls_frame.rowconfigure(0, weight=1)
+        urls_frame.rowconfigure(1, weight=1)
 
-        self.urls_text = tk.Text(urls_frame, wrap="none", font=("Consolas", 10), relief="flat", borderwidth=0)
-        self.urls_text.grid(row=0, column=0, sticky="nsew")
+        urls_tools = ttk.Frame(urls_frame)
+        urls_tools.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
+        self.paste_urls_button = ttk.Button(urls_tools, text="Вставить из буфера", command=self.paste_urls_from_clipboard)
+        self.paste_urls_button.pack(side="left")
+        self.remove_selected_button = ttk.Button(urls_tools, text="Удалить выделенное", command=self.delete_selected_urls)
+        self.remove_selected_button.pack(side="left", padx=(8, 0))
+        self.save_urls_button = ttk.Button(urls_tools, text="Сохранить список в TXT", command=self.export_urls_to_txt)
+        self.save_urls_button.pack(side="left", padx=(8, 0))
+        self.urls_count_label = ttk.Label(urls_tools, text="Ссылок: 0")
+        self.urls_count_label.pack(side="right")
+
+        self.urls_text = tk.Text(urls_frame, wrap="none", font=("Consolas", 10), relief="flat", borderwidth=0, undo=True)
+        self.urls_text.grid(row=1, column=0, sticky="nsew")
         urls_scroll = ttk.Scrollbar(urls_frame, orient="vertical", command=self.urls_text.yview)
-        urls_scroll.grid(row=0, column=1, sticky="ns")
+        urls_scroll.grid(row=1, column=1, sticky="ns")
         self.urls_text.configure(yscrollcommand=urls_scroll.set)
+        self.urls_text.bind("<KeyRelease>", self._on_urls_text_changed)
+        self.urls_text.bind("<<Paste>>", self._on_urls_text_changed)
+        self.urls_text.bind("<<Cut>>", self._on_urls_text_changed)
+        self.urls_text.bind("<<Undo>>", self._on_urls_text_changed)
+        self.urls_text.bind("<<Redo>>", self._on_urls_text_changed)
+        self._build_urls_context_menu()
 
         progress_frame = ttk.LabelFrame(main, text="Прогресс", padding=12)
         progress_frame.grid(row=3, column=0, sticky="ew", pady=(10, 10))
@@ -467,6 +483,80 @@ class HtmlDownloaderApp:
             PLAYWRIGHT_AVAILABLE = False
             PLAYWRIGHT_IMPORT_ERROR = str(exc)
 
+    def _build_urls_context_menu(self) -> None:
+        self.urls_context_menu = tk.Menu(self.root, tearoff=0)
+        self.urls_context_menu.add_command(label="Вырезать", command=lambda: self._event_generate_safe("<<Cut>>"))
+        self.urls_context_menu.add_command(label="Копировать", command=lambda: self._event_generate_safe("<<Copy>>"))
+        self.urls_context_menu.add_command(label="Вставить", command=self.paste_urls_from_clipboard)
+        self.urls_context_menu.add_separator()
+        self.urls_context_menu.add_command(label="Удалить выделенное", command=self.delete_selected_urls)
+        self.urls_context_menu.add_command(label="Выделить всё", command=self._select_all_urls)
+        self.urls_text.bind("<Button-3>", self._show_urls_context_menu)
+        self.urls_text.bind("<Control-a>", self._select_all_urls)
+        self._update_urls_count()
+
+    def _show_urls_context_menu(self, event: tk.Event) -> str:
+        self.urls_context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _select_all_urls(self, event: tk.Event | None = None) -> str:
+        self.urls_text.focus_set()
+        self.urls_text.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def _event_generate_safe(self, sequence: str) -> None:
+        self.urls_text.focus_set()
+        self.urls_text.event_generate(sequence)
+        self._update_urls_count()
+
+    def _on_urls_text_changed(self, event: tk.Event | None = None) -> None:
+        self.root.after(10, self._update_urls_count)
+
+    def _update_urls_count(self) -> None:
+        count = len(self._parse_urls(self.urls_text.get("1.0", "end")))
+        self.urls_count_label.configure(text=f"Ссылок: {count}")
+
+    def paste_urls_from_clipboard(self) -> None:
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            messagebox.showwarning("Буфер обмена пуст", "Не удалось получить текст из буфера обмена.")
+            return
+
+        payload = text.strip()
+        if not payload:
+            messagebox.showwarning("Буфер обмена пуст", "В буфере обмена нет текста со ссылками.")
+            return
+
+        current = self.urls_text.get("1.0", "end").strip()
+        self.urls_text.focus_set()
+        if current:
+            self.urls_text.insert("end", "\n" + payload)
+        else:
+            self.urls_text.insert("1.0", payload)
+        self._update_urls_count()
+        self._append_log("Ссылки вставлены из буфера обмена.")
+
+    def delete_selected_urls(self) -> None:
+        try:
+            self.urls_text.delete("sel.first", "sel.last")
+            self._update_urls_count()
+        except tk.TclError:
+            messagebox.showinfo("Нет выделения", "Сначала выделите текст, который нужно удалить.")
+
+    def export_urls_to_txt(self) -> None:
+        file_path = filedialog.asksaveasfilename(
+            title="Сохранить список ссылок",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not file_path:
+            return
+
+        text = self.urls_text.get("1.0", "end").strip()
+        Path(file_path).write_text(text + ("\n" if text else ""), encoding="utf-8")
+        self._append_log(f"Список ссылок сохранён: {file_path}")
+
     def import_urls(self) -> None:
         file_path = filedialog.askopenfilename(
             title="Выберите файл со ссылками",
@@ -495,6 +585,7 @@ class HtmlDownloaderApp:
 
     def clear_urls(self) -> None:
         self.urls_text.delete("1.0", "end")
+        self._update_urls_count()
 
     def request_stop(self) -> None:
         self.stop_requested = True
